@@ -32,13 +32,14 @@ a human always reviews the draft reply before it goes out.
 # --- Standard library imports -------------------------------------------
 import asyncio  # lets us call the "async" AI functions from a normal script
 import os  # lets us read environment variables (our Foundry settings)
+import re  # lets us strip markdown code fences some models add around JSON
 import sys  # lets us read the command-line argument (the inquiry file path)
 from pathlib import Path  # an easy way to build file paths that work on any OS
 from typing import Literal  # lets us restrict a field to a fixed set of values
 
 # --- Third-party imports -------------------------------------------------
 from dotenv import load_dotenv  # reads settings out of a local ".env" file
-from pydantic import BaseModel, Field  # describes the exact shape of the AI's answer
+from pydantic import BaseModel, Field, ValidationError  # describes the exact shape of the AI's answer
 
 # --- Microsoft Agent Framework imports -----------------------------------
 # Agent: the thing that actually talks to the AI model and manages the conversation.
@@ -160,6 +161,33 @@ Here are the two documents you must use for all prices and policies:
 
 
 # -------------------------------------------------------------------------
+# Step 3b: Some models don't return plain JSON — they wrap it in a markdown
+# code fence like ```json ... ```. This helper strips that fence off (if it's
+# there) so parsing works no matter which model is selected.
+# -------------------------------------------------------------------------
+CODE_FENCE_PATTERN = re.compile(r"^```[a-zA-Z]*\s*\n?(.*?)\n?```\s*$", flags=re.DOTALL)
+
+
+def strip_markdown_code_fence(text: str) -> str:
+    """Remove a surrounding ```...``` markdown code fence, if present.
+
+    Example input:
+        ```json
+        {"category": "BILLING"}
+        ```
+    Returns:
+        {"category": "BILLING"}
+
+    If there is no code fence, the text is returned unchanged (just trimmed).
+    """
+    cleaned = text.strip()
+    match = CODE_FENCE_PATTERN.match(cleaned)
+    if match:
+        cleaned = match.group(1).strip()
+    return cleaned
+
+
+# -------------------------------------------------------------------------
 # Step 4: The main logic — read the inquiry file, call the AI, print the result
 # -------------------------------------------------------------------------
 async def triage_inquiry(inquiry_text: str) -> TriageResult:
@@ -198,10 +226,20 @@ async def triage_inquiry(inquiry_text: str) -> TriageResult:
     # exactly like our TriageResult model (see Step 2 above).
     response = await agent.run(inquiry_text, options={"response_format": TriageResult})
 
-    if response.value is None:
+    # Some models return clean JSON; others wrap it in a ```json ... ``` code
+    # fence. Strip that off ourselves before parsing, so this works the same
+    # way regardless of which model is selected.
+    cleaned_text = strip_markdown_code_fence(response.text)
+
+    if not cleaned_text:
         raise SystemExit(f"The agent did not return a structured result. Raw text:\n{response.text}")
 
-    return response.value
+    try:
+        return TriageResult.model_validate_json(cleaned_text)
+    except ValidationError as exc:
+        raise SystemExit(
+            f"The agent's reply could not be parsed as the expected result: {exc}\n\nRaw text:\n{response.text}"
+        )
 
 
 def print_result(result: TriageResult) -> None:

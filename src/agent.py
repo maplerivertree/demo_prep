@@ -44,8 +44,12 @@ from pydantic import BaseModel, Field, ValidationError  # describes the exact sh
 # --- Microsoft Agent Framework imports -----------------------------------
 # Agent: the thing that actually talks to the AI model and manages the conversation.
 # FoundryChatClient: tells the Agent to use a Microsoft Foundry project as the AI backend.
+# ResponsesHostServer: turns the Agent into a small web server that speaks the
+# protocol Foundry's *hosted agent* runtime expects (including the "/readiness"
+# health-check endpoint the runtime polls after deployment). We only need this
+# when this script is running as a deployed hosted agent — see run_hosted_server().
 from agent_framework import Agent
-from agent_framework.foundry import FoundryChatClient
+from agent_framework.foundry import FoundryChatClient, ResponsesHostServer
 
 # configure_otel_providers: turns on OpenTelemetry tracing that the Agent
 # Framework understands out of the box (no manual span code needed) so you
@@ -219,10 +223,15 @@ def print_step(step_name: str, message: str) -> None:
 
 
 # -------------------------------------------------------------------------
-# Step 4: The main logic — read the inquiry file, call the AI, print the result
+# Step 4: Build the Agent itself.
 # -------------------------------------------------------------------------
-async def triage_inquiry(inquiry_text: str) -> TriageResult:
-    """Send one inquiry to the Foundry-hosted model and return the structured result."""
+# This one function builds the Agent object, and is shared by both ways this
+# script can run:
+#   - Locally from a terminal, on one inquiry file at a time (see main()).
+#   - As a Foundry *hosted agent*, where Foundry starts this same script as a
+#     long-running server and sends it requests over HTTP (see run_hosted_server()).
+def build_agent() -> Agent:
+    """Create the Agent, wired up to our Foundry project and model deployment."""
 
     # These two settings tell the agent which Foundry project and which
     # model deployment inside it to talk to. See .env.sample for details.
@@ -236,14 +245,15 @@ async def triage_inquiry(inquiry_text: str) -> TriageResult:
         )
 
     # AzureCliCredential re-uses your existing "az login" session, so no API
-    # keys or secrets are ever stored in this project.
+    # keys or secrets are ever stored in this project. (When deployed as a
+    # hosted agent, Foundry provides credentials automatically the same way.)
     credential = AzureCliCredential()
 
     # The Agent is the object we actually talk to. Its "client" tells it to
     # use our Microsoft Foundry project and model deployment as the AI brain,
     # and "instructions" is the system prompt built above (SPEC.md rules +
     # the two grounding documents).
-    agent = Agent(
+    return Agent(
         client=FoundryChatClient(
             project_endpoint=project_endpoint,
             model=model_deployment_name,
@@ -251,12 +261,54 @@ async def triage_inquiry(inquiry_text: str) -> TriageResult:
         ),
         name="cascade-triage-agent",
         instructions=build_system_instructions(),
+        default_options={
+            # Always ask for the answer shaped like our TriageResult model,
+            # for every caller — whether that's this script's CLI mode below,
+            # or a request coming in through the hosted-agent server.
+            "response_format": TriageResult,
+            # History is managed by the hosting infrastructure when this
+            # agent is deployed, so we don't need the model provider to also
+            # store it. See: https://developers.openai.com/api/reference/resources/responses/methods/create
+            "store": False,
+        },
     )
 
-    # Ask the agent to respond, and request that the response be shaped
-    # exactly like our TriageResult model (see Step 2 above).
+
+# -------------------------------------------------------------------------
+# Step 4b: Run as a Foundry *hosted* agent.
+# -------------------------------------------------------------------------
+# When you deploy this agent to Microsoft Foundry, the hosted-agent runtime
+# runs this exact script with NO command-line argument (unlike local usage,
+# which always passes an inquiry file path). It then repeatedly checks a
+# "/readiness" HTTP endpoint until it gets back HTTP 200, and after that sends
+# it requests over HTTP too.
+#
+# ResponsesHostServer (from agent_framework.foundry) already implements both
+# of those things for us — the "/readiness" endpoint and the "/responses"
+# endpoint Foundry calls to actually run the agent — and listens on the port
+# the hosted runtime expects. So the only thing we have to do is build the
+# Agent and hand it to the server.
+def run_hosted_server() -> None:
+    """Start this agent as a long-running Foundry hosted-agent server."""
+    print_step("HOSTED", "Starting as a Foundry hosted agent (Responses protocol)...")
+    agent = build_agent()
+    server = ResponsesHostServer(agent)
+    server.run()
+
+
+# -------------------------------------------------------------------------
+# Step 5: The main logic — read the inquiry file, call the AI, print the result
+# -------------------------------------------------------------------------
+async def triage_inquiry(inquiry_text: str) -> TriageResult:
+    """Send one inquiry to the Foundry-hosted model and return the structured result."""
+
+    agent = build_agent()
+
+    # Ask the agent to respond. "response_format" (see build_agent above) is
+    # already set as a default, so every reply comes back shaped like our
+    # TriageResult model.
     print_step("CLASSIFY", "Sending inquiry to the AI model for classification and drafting...")
-    response = await agent.run(inquiry_text, options={"response_format": TriageResult})
+    response = await agent.run(inquiry_text)
 
     # Some models return clean JSON; others wrap it in a ```json ... ``` code
     # fence. Strip that off ourselves before parsing, so this works the same
@@ -298,7 +350,14 @@ def print_result(result: TriageResult) -> None:
 
 
 def main() -> None:
-    # This script expects exactly one argument: the path to the inquiry file.
+    # Foundry's hosted-agent runtime starts this script with NO arguments and
+    # expects it to stay running as a server (see run_hosted_server above).
+    # Running it yourself from a terminal always passes exactly one argument
+    # — the inquiry file — and prints a single result, same as before.
+    if len(sys.argv) == 1:
+        run_hosted_server()
+        return
+
     if len(sys.argv) != 2:
         raise SystemExit("Usage: python src/agent.py <path-to-inquiry-file>")
 

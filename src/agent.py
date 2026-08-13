@@ -47,6 +47,11 @@ from pydantic import BaseModel, Field, ValidationError  # describes the exact sh
 from agent_framework import Agent
 from agent_framework.foundry import FoundryChatClient
 
+# configure_otel_providers: turns on OpenTelemetry tracing that the Agent
+# Framework understands out of the box (no manual span code needed) so you
+# can watch each step of a run in the Foundry Toolkit's trace viewer.
+from agent_framework.observability import configure_otel_providers
+
 # AzureCliCredential: lets us log in to Azure using the same login as the
 # "az login" command, instead of typing in any secret API keys.
 from azure.identity import AzureCliCredential
@@ -59,6 +64,20 @@ from azure.identity import AzureCliCredential
 # .env.sample for the two values this agent needs.
 load_dotenv()
 
+# -------------------------------------------------------------------------
+# Step 1b: Turn on tracing.
+# -------------------------------------------------------------------------
+# This sends OpenTelemetry traces to the Foundry Toolkit's local trace
+# collector, running on your machine, so you can open the trace viewer in
+# VS Code and see exactly what the agent did on each run (which model was
+# called, what was sent, what came back, how long it took, etc).
+# enable_sensitive_data=True also captures the actual prompt/response text,
+# which is what you want while developing locally.
+configure_otel_providers(
+    vs_code_extension_port=4317,  # Foundry Toolkit's local trace collector (gRPC)
+    enable_sensitive_data=True,
+)
+
 # The folder that contains this script (src/), and its parent (the project root).
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
@@ -70,7 +89,10 @@ def load_grounding_documents() -> str:
     text glued together with clear headers, so we can paste it straight into
     the AI's instructions.
     """
+    print_step("GROUNDING", f"Looking up {DOCS_DIR / 'price_sheet.md'}")
     price_sheet = (DOCS_DIR / "price_sheet.md").read_text(encoding="utf-8")
+
+    print_step("GROUNDING", f"Looking up {DOCS_DIR / 'service-policy.md'}")
     service_policy = (DOCS_DIR / "service-policy.md").read_text(encoding="utf-8")
 
     return (
@@ -188,6 +210,15 @@ def strip_markdown_code_fence(text: str) -> str:
 
 
 # -------------------------------------------------------------------------
+# Step 3c: A tiny helper so every step of the agent's work is printed to the
+# terminal in the same, easy-to-scan format: "[STEP_NAME] message".
+# -------------------------------------------------------------------------
+def print_step(step_name: str, message: str) -> None:
+    """Print one line of the step-by-step trace, e.g. [CLASSIFY] category: NEW_JOB."""
+    print(f"[{step_name}] {message}")
+
+
+# -------------------------------------------------------------------------
 # Step 4: The main logic — read the inquiry file, call the AI, print the result
 # -------------------------------------------------------------------------
 async def triage_inquiry(inquiry_text: str) -> TriageResult:
@@ -224,6 +255,7 @@ async def triage_inquiry(inquiry_text: str) -> TriageResult:
 
     # Ask the agent to respond, and request that the response be shaped
     # exactly like our TriageResult model (see Step 2 above).
+    print_step("CLASSIFY", "Sending inquiry to the AI model for classification and drafting...")
     response = await agent.run(inquiry_text, options={"response_format": TriageResult})
 
     # Some models return clean JSON; others wrap it in a ```json ... ``` code
@@ -235,11 +267,25 @@ async def triage_inquiry(inquiry_text: str) -> TriageResult:
         raise SystemExit(f"The agent did not return a structured result. Raw text:\n{response.text}")
 
     try:
-        return TriageResult.model_validate_json(cleaned_text)
+        result = TriageResult.model_validate_json(cleaned_text)
     except ValidationError as exc:
         raise SystemExit(
             f"The agent's reply could not be parsed as the expected result: {exc}\n\nRaw text:\n{response.text}"
         )
+
+    # --- Trace: show the classification the agent settled on -----------
+    print_step("CLASSIFY", f"category={result.category}  confidence={result.confidence}")
+
+    # --- Trace: show the escalation decision ----------------------------
+    if result.escalate:
+        print_step("ESCALATE", f"true — {result.escalate_reason}")
+    else:
+        print_step("ESCALATE", "false — no escalation needed")
+
+    # --- Trace: note that the draft reply is ready ----------------------
+    print_step("DRAFT", "Draft reply written, ready for human review.")
+
+    return result
 
 
 def print_result(result: TriageResult) -> None:
@@ -260,9 +306,11 @@ def main() -> None:
     if not inquiry_path.is_file():
         raise SystemExit(f"Inquiry file not found: {inquiry_path}")
 
+    print_step("READ", f"Reading inquiry from {inquiry_path}")
     inquiry_text = inquiry_path.read_text(encoding="utf-8")
 
     result = asyncio.run(triage_inquiry(inquiry_text))
+    print("-" * 40)
     print_result(result)
 
 
